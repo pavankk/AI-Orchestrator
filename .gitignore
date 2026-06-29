@@ -1,0 +1,8 @@
+run/*.pid
+run/*.lock
+run/*.heartbeat
+checkpoints/
+logs/
+.claude/settings.local.json
+config/asana.conf
+bin/__pycache__/

@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+# orch — AI Orchestrator CLI
+# Usage: orch <command> [agent|all] [flags]
+set -uo pipefail
+
+# Resolve symlinks so ORCH_HOME is correct even when orch is called via ~/.local/bin
+_SRC="${BASH_SOURCE[0]}"
+while [[ -L "$_SRC" ]]; do
+    _DIR="$(cd -P "$(dirname "$_SRC")" && pwd)"
+    _SRC="$(readlink "$_SRC")"
+    [[ "$_SRC" != /* ]] && _SRC="$_DIR/$_SRC"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_SRC")" && pwd)"
+ORCH_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+export ORCH_HOME
+
+source "$ORCH_HOME/config/settings.conf"
+
+# ── Colors ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+
+err()  { printf "${RED}error:${RESET} %s\n" "$*" >&2; }
+info() { printf "${CYAN}→${RESET} %s\n" "$*"; }
+ok()   { printf "${GREEN}✓${RESET} %s\n" "$*"; }
+warn() { printf "${YELLOW}!${RESET} %s\n" "$*"; }
+
+list_all_agents() {
+    for dir in "$AGENTS_DIR"/*/; do
+        [[ -f "$dir/config.conf" ]] && basename "$dir"
+    done | sort
+}
+
+list_enabled_agents() {
+    for dir in "$AGENTS_DIR"/*/; do
+        local id cfg enabled
+        id=$(basename "$dir")
+        cfg="$dir/config.conf"
+        [[ -f "$cfg" ]] || continue
+        enabled=$(bash -c "source '$ORCH_HOME/config/settings.conf'; source '$cfg'; echo \${ENABLED:-false}")
+        [[ "$enabled" == "true" ]] && echo "$id"
+    done | sort
+}
+
+resolve_agents() {
+    local target="${1:-all}"
+    if [[ "$target" == "all" ]]; then
+        list_enabled_agents
+    else
+        [[ -d "$AGENTS_DIR/$target" ]] || { err "Unknown agent: $target"; exit 1; }
+        echo "$target"
+    fi
+}
+
+session_name()  { echo "${TMUX_PREFIX}${1}"; }
+session_alive() { tmux has-session -t "$(session_name "$1")" 2>/dev/null; }
+
+load_cp() {
+    local id="$1"
+    local f="$CHECKPOINTS_DIR/${id}.json"
+    [[ -f "$f" ]] && cat "$f" || echo '{}'
+}
+
+cp_field() { echo "$1" | jq -r "${2} // \"—\""; }
+
+agent_status() {
+    local id="$1"
+    if session_alive "$id"; then
+        local cp status
+        cp=$(load_cp "$id")
+        status=$(cp_field "$cp" '.status')
+        [[ "$status" == "null" || "$status" == "—" ]] && status="running"
+        echo "$status"
+    else
+        echo "stopped"
+    fi
+}
+
+heartbeat_age() {
+    local id="$1"
+    local hb="$RUN_DIR/${id}.heartbeat"
+    [[ -f "$hb" ]] || { echo "n/a"; return; }
+    local hb_ts diff
+    hb_ts=$(cat "$hb")
+    diff=$(( $(date +%s) - hb_ts ))
+    if   (( diff < 60   )); then echo "${diff}s ago"
+    elif (( diff < 3600 )); then echo "$(( diff / 60 ))m ago"
+    else                        echo "$(( diff / 3600 ))h ago"
+    fi
+}
+
+status_color() {
+    case "$1" in
+        running)  printf '%b' "$GREEN" ;;
+        idle)     printf '%b' "$CYAN"  ;;
+        quota)    printf '%b' "$YELLOW";;
+        error)    printf '%b' "$RED"   ;;
+        stopped)  printf '%b' "$DIM"   ;;
+        *)        printf '%b' "$RESET" ;;
+    esac
+}
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    printf '\n%bConfigured agents%b\n\n' "$BOLD" "$RESET"
+    printf '%-18s %-10s %s\n' "AGENT" "ENABLED" "DESCRIPTION"
+    printf '%s\n' "─────────────────────────────────────────────"
+    for id in $(list_all_agents); do
+        local cfg="$AGENTS_DIR/$id/config.conf"
+        local enabled desc
+        enabled=$(bash -c "source '$ORCH_HOME/config/settings.conf'; source '$cfg'; echo \${ENABLED:-false}")
+        desc=$(bash -c "source '$ORCH_HOME/config/settings.conf'; source '$cfg'; echo \${DESCRIPTION:-}" 2>/dev/null || echo "")
+        local marker=( "$DIM" "false" )
+        [[ "$enabled" == "true" ]] && marker=( "$GREEN" "true " )
+        printf "%-18s %b%-10s%b %s\n" "$id" "${marker[0]}" "${marker[1]}" "$RESET" "$desc"
+    done
+    printf '\n'
+}
+
+cmd_status() {
+    local target="${1:-all}"
+    printf '\n%bAgent Status%b  %b%s%b\n\n' "$BOLD" "$RESET" "$DIM" "$(date '+%Y-%m-%d %H:%M:%S')" "$RESET"
+    printf '%-18s %-10s %-6s %-14s %-12s %s\n' \
+        "AGENT" "STATUS" "ITER" "CHECKPOINT" "HEARTBEAT" "CONTEXT"
+    printf '%s\n' "──────────────────────────────────────────────────────────────────────────────"
+    local found=0
+    while IFS= read -r id; do
+        [[ -z "$id" ]] && continue
+        found=1
+        local cp status iter ckpt ctx
+        cp=$(load_cp "$id")
+        status=$(agent_status "$id")
+        iter=$(cp_field "$cp" '.iteration')
+        ckpt=$(cp_field "$cp" '.last_checkpoint')
+        ctx=$(cp_field "$cp" '.context')
+        [[ ${#ctx} -gt 35 ]] && ctx="${ctx:0:35}…"
+        [[ "$ckpt" != "—" ]] && ckpt="${ckpt:11:8}"   # keep HH:MM:SS
+        local hb
+        hb=$(heartbeat_age "$id")
+        local c
+        c=$(status_color "$status")
+        printf '%-18s %b%-10s%b %-6s %-14s %-12s %s\n' \
+            "$id" "$c" "$status" "$RESET" "$iter" "$ckpt" "$hb" "$ctx"
+    done < <(resolve_agents "$target")
+    [[ $found -eq 0 ]] && printf '  %b(no enabled agents — run: orch enable <name>)%b\n' "$DIM" "$RESET"
+    printf '\n'
+}
+
+cmd_start() {
+    local target="${1:-all}"
+    while IFS= read -r id; do
+        [[ -z "$id" ]] && continue
+        local session
+        session=$(session_name "$id")
+        if session_alive "$id"; then
+            warn "Agent $id already running (session: $session)"
+            continue
+        fi
+        info "Starting agent: $id"
+        tmux new-session -d -s "$session" \
+            -e "ORCH_HOME=$ORCH_HOME" \
+            "$ORCH_HOME/bin/agent-runner $id" \
+            && ok "Started $id (tmux: $session)" \
+            || err "Failed to start $id"
+    done < <(resolve_agents "$target")
+}
+
+cmd_stop() {
+    local target="${1:-all}"
+    while IFS= read -r id; do
+        [[ -z "$id" ]] && continue
+        local session
+        session=$(session_name "$id")
+        if ! session_alive "$id"; then
+            warn "Agent $id not running"
+            continue
+        fi
+        info "Stopping agent: $id"
+        local pid_file="$RUN_DIR/${id}.pid"
+        if [[ -f "$pid_file" ]]; then
+            local pid
+            pid=$(cat "$pid_file")
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 2
+        fi
+        tmux kill-session -t "$session" 2>/dev/null && ok "Stopped $id" || err "Failed to stop $id"
+        rm -f "$RUN_DIR/${id}.pid" "$RUN_DIR/${id}.heartbeat"
+    done < <(resolve_agents "$target")
+}
+
+cmd_restart() {
+    local target="${1:-all}"
+    cmd_stop "$target"
+    sleep 1
+    cmd_start "$target"
+}
+
+cmd_logs() {
+    local id="${1:?Usage: orch logs <agent> [-f]}"
+    local follow="${2:-}"
+    local log_file="$LOGS_DIR/${id}.log"
+    [[ -f "$log_file" ]] || { err "No log file for $id"; exit 1; }
+    if [[ "$follow" == "-f" || "$follow" == "--follow" ]]; then
+        tail -f "$log_file"
+    else
+        tail -100 "$log_file"
+    fi
+}
+
+cmd_attach() {
+    local id="${1:?Usage: orch attach <agent>}"
+    local session
+    session=$(session_name "$id")
+    session_alive "$id" || { err "Agent $id not running"; exit 1; }
+    info "Attaching to $session (Ctrl+b d to detach)"
+    tmux attach-session -t "$session"
+}
+
+cmd_checkpoint() {
+    local id="${1:?Usage: orch checkpoint <agent>}"
+    local f="$CHECKPOINTS_DIR/${id}.json"
+    [[ -f "$f" ]] || { err "No checkpoint for $id"; exit 1; }
+    jq '.' "$f"
+}
+
+cmd_health() {
+    printf '\n%bSystem Health%b\n\n' "$BOLD" "$RESET"
+    printf 'Orchestrator home: %s\n' "$ORCH_HOME"
+
+    local daemon_pid_file="$RUN_DIR/daemon.pid"
+    if [[ -f "$daemon_pid_file" ]] && kill -0 "$(cat "$daemon_pid_file")" 2>/dev/null; then
+        ok "Daemon running (PID $(cat "$daemon_pid_file"))"
+    else
+        warn "Daemon not running — run: orch daemon-start"
+    fi
+
+    local tmux_server
+    tmux_server=$(tmux info 2>/dev/null | head -1 || echo "not running")
+    ok "tmux: $tmux_server"
+
+    printf '\n'
+    for id in $(list_enabled_agents); do
+        local status
+        status=$(agent_status "$id")
+        local c
+        c=$(status_color "$status")
+        printf '  %-18s %b%s%b\n' "$id" "$c" "$status" "$RESET"
+    done
+    printf '\n'
+}
+
+cmd_enable() {
+    local id="${1:?Usage: orch enable <agent>}"
+    local cfg="$AGENTS_DIR/$id/config.conf"
+    [[ -f "$cfg" ]] || { err "Unknown agent: $id"; exit 1; }
+    if grep -q '^ENABLED=' "$cfg"; then
+        sed -i '' 's/^ENABLED=.*/ENABLED="true"/' "$cfg"
+    else
+        echo 'ENABLED="true"' >> "$cfg"
+    fi
+    ok "Agent $id enabled"
+}
+
+cmd_disable() {
+    local id="${1:?Usage: orch disable <agent>}"
+    local cfg="$AGENTS_DIR/$id/config.conf"
+    [[ -f "$cfg" ]] || { err "Unknown agent: $id"; exit 1; }
+    if grep -q '^ENABLED=' "$cfg"; then
+        sed -i '' 's/^ENABLED=.*/ENABLED="false"/' "$cfg"
+    else
+        echo 'ENABLED="false"' >> "$cfg"
+    fi
+    warn "Agent $id disabled"
+}
+
+cmd_daemon_start() {
+    local pid_file="$RUN_DIR/daemon.pid"
+    if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+        warn "Daemon already running (PID $(cat "$pid_file"))"
+        return
+    fi
+    mkdir -p "$LOGS_DIR" "$RUN_DIR"
+    nohup "$ORCH_HOME/bin/orch-daemon" >> "$LOGS_DIR/daemon.log" 2>&1 &
+    ok "Daemon started (PID $!)"
+}
+
+cmd_daemon_stop() {
+    local lock_file="$RUN_DIR/daemon.lock"
+    local pid_file="$RUN_DIR/daemon.pid"
+    local pid=""
+    [[ -f "$pid_file" ]] && pid=$(cat "$pid_file")
+    [[ -z "$pid" && -f "$lock_file" ]] && pid=$(cat "$lock_file")
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        warn "Daemon not running"
+        rm -f "$lock_file" "$pid_file"
+        return
+    fi
+    kill -TERM "$pid" 2>/dev/null
+    local i=0
+    while kill -0 "$pid" 2>/dev/null && (( i < 10 )); do
+        i=$(( i + 1 ))
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null
+        warn "Force-killed daemon (PID $pid)"
+    else
+        ok "Daemon stopped (PID $pid)"
+    fi
+    rm -f "$lock_file" "$pid_file"
+}
+
+cmd_dashboard() {
+    exec "$ORCH_HOME/bin/dashboard" "$@"
+}
+
+cmd_reset_checkpoint() {
+    local id="${1:?Usage: orch reset-checkpoint <agent>}"
+    local f="$CHECKPOINTS_DIR/${id}.json"
+    rm -f "$f"
+    ok "Checkpoint cleared for $id"
+}
+
+usage() {
+    cat <<EOF
+
+${BOLD}orch${RESET} — AI Orchestrator CLI
+
+${BOLD}USAGE${RESET}
+  orch <command> [agent|all] [flags]
+
+${BOLD}AGENT COMMANDS${RESET}
+  start   [agent|all]         Start enabled agent(s)
+  stop    [agent|all]         Stop running agent(s)
+  restart [agent|all]         Restart agent(s)
+  status  [agent|all]         Show status table
+  logs    <agent> [-f]        Tail agent log
+  attach  <agent>             Attach to agent's tmux session
+  checkpoint <agent>          Dump checkpoint JSON
+  reset-checkpoint <agent>    Clear checkpoint (fresh start)
+
+${BOLD}CONFIG COMMANDS${RESET}
+  enable  <agent>             Enable agent (daemon will start it)
+  disable <agent>             Disable agent (daemon won't restart it)
+  list                        List all configured agents
+
+${BOLD}SYSTEM COMMANDS${RESET}
+  daemon-start                Start the watchdog daemon
+  daemon-stop                 Stop the watchdog daemon
+  health                      System health overview
+  dashboard                   Launch live dashboard
+
+${BOLD}EXAMPLES${RESET}
+  orch start all              # start all enabled agents
+  orch logs inbox -f          # follow inbox agent log
+  orch attach coding          # open tmux session for coding agent
+  orch restart research       # restart one agent
+  orch enable monitoring      # mark monitoring as enabled
+  orch status                 # show all agent statuses
+
+EOF
+}
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+    start)            cmd_start    "${1:-all}" ;;
+    stop)             cmd_stop     "${1:-all}" ;;
+    restart)          cmd_restart  "${1:-all}" ;;
+    status|st)        cmd_status   "${1:-all}" ;;
+    logs)             cmd_logs     "$@"        ;;
+    attach)           cmd_attach   "${1:?}"    ;;
+    checkpoint|cp)    cmd_checkpoint "${1:?}"  ;;
+    reset-checkpoint) cmd_reset_checkpoint "${1:?}" ;;
+    enable)           cmd_enable   "${1:?}"    ;;
+    disable)          cmd_disable  "${1:?}"    ;;
+    list|ls)          cmd_list                 ;;
+    daemon-start)     cmd_daemon_start         ;;
+    daemon-stop)      cmd_daemon_stop          ;;
+    health)           cmd_health               ;;
+    dashboard|dash)   cmd_dashboard "$@"       ;;
+    help|--help|-h)   usage                    ;;
+    *)                err "Unknown command: $CMD"; usage; exit 1 ;;
+esac

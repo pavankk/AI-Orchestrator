@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""
+dashboard — live terminal dashboard for the AI Orchestrator
+Reads checkpoint JSONs and tmux session state; refreshes every N seconds.
+"""
+import json
+import os
+import select
+import subprocess
+import sys
+import termios
+import tty
+from datetime import datetime, timezone
+
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+ORCH_HOME = os.environ.get(
+    "ORCH_HOME",
+    os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+)
+REFRESH_SECS = int(os.environ.get("DASHBOARD_INTERVAL", "3"))
+
+# ── ANSI ─────────────────────────────────────────────────────────────────────
+
+class C:
+    BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    RED     = "\033[31m"
+    GREEN   = "\033[32m"
+    YELLOW  = "\033[33m"
+    CYAN    = "\033[36m"
+    WHITE   = "\033[37m"
+    RESET   = "\033[0m"
+
+STATUS_COLOR = {
+    "running": C.GREEN,
+    "idle":    C.CYAN,
+    "quota":   C.YELLOW,
+    "error":   C.RED,
+    "stopped": C.DIM,
+}
+
+# ── Data helpers ─────────────────────────────────────────────────────────────
+
+def get_agents():
+    agents_dir = os.path.join(ORCH_HOME, "agents")
+    if not os.path.isdir(agents_dir):
+        return []
+    return sorted(
+        d for d in os.listdir(agents_dir)
+        if os.path.isdir(os.path.join(agents_dir, d))
+        and os.path.isfile(os.path.join(agents_dir, d, "config.conf"))
+    )
+
+
+def load_checkpoint(agent_id):
+    path = os.path.join(ORCH_HOME, "checkpoints", f"{agent_id}.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def session_alive(agent_id):
+    tmux_prefix = _setting("TMUX_PREFIX", "ai-")
+    r = subprocess.run(
+        ["tmux", "has-session", "-t", f"{tmux_prefix}{agent_id}"],
+        capture_output=True
+    )
+    return r.returncode == 0
+
+
+def _setting(key, default=""):
+    """Read a value from settings.conf without sourcing bash."""
+    conf = os.path.join(ORCH_HOME, "config", "settings.conf")
+    try:
+        with open(conf) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(f"{key}="):
+                    val = line.split("=", 1)[1].strip().strip('"')
+                    return val
+    except Exception:
+        pass
+    return default
+
+
+def heartbeat_age(agent_id):
+    path = os.path.join(ORCH_HOME, "run", f"{agent_id}.heartbeat")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            raw = f.read().strip()
+        import time
+        return time.time() - int(raw)
+    except Exception:
+        return None
+
+
+def effective_status(agent_id, cp):
+    if not session_alive(agent_id):
+        return "stopped"
+    s = cp.get("status", "running")
+    if not s or s == "null":
+        return "running"
+    return s
+
+
+def fmt_age(secs):
+    if secs is None:
+        return "n/a"
+    secs = int(secs)
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs//60}m ago"
+    return f"{secs//3600}h ago"
+
+
+def fmt_checkpoint(iso):
+    if not iso or iso == "—":
+        return "never"
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - dt).total_seconds()
+        return fmt_age(age)
+    except Exception:
+        return iso[11:19] if len(iso) > 19 else iso
+
+
+def tail_log(agent_id, n=3):
+    log_path = os.path.join(ORCH_HOME, "logs", f"{agent_id}.log")
+    if not os.path.isfile(log_path):
+        return ""
+    try:
+        r = subprocess.run(
+            ["tail", f"-{n}", log_path],
+            capture_output=True, text=True, timeout=1
+        )
+        lines = r.stdout.strip().splitlines()
+        return lines[-1][:60] if lines else ""
+    except Exception:
+        return ""
+
+
+# ── Rendering ─────────────────────────────────────────────────────────────────
+
+def clear():
+    print("\033[H\033[2J", end="", flush=True)
+
+
+def draw(agents, selected=0, show_log=False):
+    clear()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cols = _term_width()
+
+    # ── Header ──
+    title = "  AI Orchestrator Dashboard  "
+    pad = max(0, (cols - len(title)) // 2)
+    print(f"{C.BOLD}{' ' * pad}{title}{C.RESET}  {C.DIM}{now}{C.RESET}")
+    print()
+
+    # ── Column headers ──
+    print(f"{C.BOLD}"
+          f"{'AGENT':<16} {'STATUS':<10} {'ITER':>5}  "
+          f"{'CHECKPOINT':<13} {'HEARTBEAT':<12} {'LAST OUTPUT'}"
+          f"{C.RESET}")
+    print("─" * min(cols, 90))
+
+    running = idle = quota = error = stopped = 0
+
+    for i, agent_id in enumerate(agents):
+        cp = load_checkpoint(agent_id)
+        status = effective_status(agent_id, cp)
+        iteration = cp.get("iteration", 0)
+        ckpt_str = fmt_checkpoint(cp.get("last_checkpoint"))
+        hb_age = heartbeat_age(agent_id)
+        hb_str = fmt_age(hb_age)
+        last_line = tail_log(agent_id, 1)[:55]
+
+        # counts
+        if   status == "running": running += 1
+        elif status == "idle":    idle += 1
+        elif status == "quota":   quota += 1
+        elif status == "error":   error += 1
+        elif status == "stopped": stopped += 1
+
+        color = STATUS_COLOR.get(status, C.WHITE)
+        sel_marker = "▶ " if i == selected else "  "
+        row_style = C.BOLD if i == selected else ""
+
+        print(
+            f"{row_style}{sel_marker}{agent_id:<14}{C.RESET} "
+            f"{color}{status:<10}{C.RESET} "
+            f"{iteration:>5}  "
+            f"{ckpt_str:<13} "
+            f"{hb_str:<12} "
+            f"{C.DIM}{last_line}{C.RESET}"
+        )
+
+    print("─" * min(cols, 90))
+
+    # ── Summary bar ──
+    summary_parts = []
+    if running: summary_parts.append(f"{C.GREEN}{running} running{C.RESET}")
+    if idle:    summary_parts.append(f"{C.CYAN}{idle} idle{C.RESET}")
+    if quota:   summary_parts.append(f"{C.YELLOW}{quota} quota{C.RESET}")
+    if error:   summary_parts.append(f"{C.RED}{error} error{C.RESET}")
+    if stopped: summary_parts.append(f"{C.DIM}{stopped} stopped{C.RESET}")
+    print("  " + "  ·  ".join(summary_parts) if summary_parts else "  no agents")
+
+    # ── Log panel (optional) ──
+    if show_log and agents:
+        agent_id = agents[selected]
+        log_path = os.path.join(ORCH_HOME, "logs", f"{agent_id}.log")
+        print()
+        print(f"{C.BOLD}── Last 10 lines: {agent_id} ─────────────────────{C.RESET}")
+        try:
+            r = subprocess.run(
+                ["tail", "-10", log_path],
+                capture_output=True, text=True, timeout=1
+            )
+            for line in r.stdout.splitlines():
+                print(f"  {C.DIM}{line[:cols-4]}{C.RESET}")
+        except Exception:
+            print("  (no log)")
+
+    # ── Key legend ──
+    print()
+    print(f"{C.DIM}  ↑↓ navigate  l log  s start  x stop  r restart  q quit{C.RESET}")
+
+
+def _term_width():
+    try:
+        import shutil
+        return shutil.get_terminal_size().columns
+    except Exception:
+        return 80
+
+
+# ── Input loop ────────────────────────────────────────────────────────────────
+
+def run_cmd(cmd):
+    """Run an orch sub-command in a subprocess."""
+    subprocess.run([os.path.join(ORCH_HOME, "bin", "orch")] + cmd)
+
+
+def main():
+    agents = get_agents()
+    if not agents:
+        print(f"No agents found in {ORCH_HOME}/agents/")
+        sys.exit(1)
+
+    selected = 0
+    show_log = False
+
+    # Restore terminal on exit
+    old_settings = termios.tcgetattr(sys.stdin)
+    try:
+        tty.setcbreak(sys.stdin.fileno())
+        last_draw = 0.0
+
+        while True:
+            now = __import__("time").time()
+            if now - last_draw >= REFRESH_SECS:
+                agents = get_agents()
+                selected = min(selected, len(agents) - 1)
+                draw(agents, selected, show_log)
+                last_draw = now
+
+            # Non-blocking key read (100 ms poll)
+            ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if not ready:
+                continue
+
+            ch = sys.stdin.read(1)
+
+            if ch == "q":
+                break
+
+            elif ch == "\x1b":                  # escape sequence
+                rest = sys.stdin.read(2)
+                if rest == "[A" and selected > 0:        # up
+                    selected -= 1; show_log = False
+                elif rest == "[B" and selected < len(agents) - 1:  # down
+                    selected += 1; show_log = False
+
+            elif ch == "l":
+                show_log = not show_log
+
+            elif ch == "s" and agents:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                run_cmd(["start", agents[selected]])
+                old_settings = termios.tcgetattr(sys.stdin)
+                tty.setcbreak(sys.stdin.fileno())
+                last_draw = 0
+
+            elif ch == "x" and agents:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                run_cmd(["stop", agents[selected]])
+                old_settings = termios.tcgetattr(sys.stdin)
+                tty.setcbreak(sys.stdin.fileno())
+                last_draw = 0
+
+            elif ch == "r" and agents:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                run_cmd(["restart", agents[selected]])
+                old_settings = termios.tcgetattr(sys.stdin)
+                tty.setcbreak(sys.stdin.fileno())
+                last_draw = 0
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+        clear()
+
+
+if __name__ == "__main__":
+    main()

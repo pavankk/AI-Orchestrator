@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""
+asana-sync — syncs AI Orchestrator state to Asana
+Reads agent checkpoints, trade alert logs, drive activity, and inbox actions,
+then creates/updates tasks in the 'Agent Orchestration Tracker' Asana project.
+
+Usage:
+  asana-sync                     # full sync (all sections)
+  asana-sync --agent inbox       # sync one agent's status task only
+  asana-sync --section agents    # sync agent status section only
+  asana-sync --section trades    # sync trade alerts only
+  asana-sync --section drive     # sync drive activity only
+  asana-sync --section actions   # sync inbox action items only
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+
+ORCH_HOME = os.environ.get(
+    "ORCH_HOME",
+    os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+)
+CONF_FILE       = os.path.join(ORCH_HOME, "config", "asana.conf")
+CACHE_FILE      = os.path.join(ORCH_HOME, "run", "asana-cache.json")
+LOG_FILE        = os.path.join(ORCH_HOME, "logs", "asana-sync.log")
+WORKSPACE       = Path.home() / "ai-workspace"
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+def load_conf():
+    conf = {}
+    if os.path.isfile(CONF_FILE):
+        with open(CONF_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, val = line.partition("=")
+                    conf[key.strip()] = val.strip().strip('"').strip("'")
+    return conf
+
+def save_conf_field(key, value):
+    if not os.path.isfile(CONF_FILE):
+        return
+    with open(CONF_FILE) as f:
+        content = f.read()
+    pattern = rf'^{re.escape(key)}=.*'
+    replacement = f'{key}="{value}"'
+    if re.search(pattern, content, re.MULTILINE):
+        content = re.sub(pattern, replacement, content, flags=re.MULTILINE)
+    else:
+        content += f'\n{replacement}\n'
+    with open(CONF_FILE, "w") as f:
+        f.write(content)
+
+# ── Cache (task GID lookup without hitting API every time) ───────────────────
+
+def load_cache():
+    if os.path.isfile(CACHE_FILE):
+        with open(CACHE_FILE) as f:
+            return json.load(f)
+    return {"tasks": {}, "sections": {}}
+
+def save_cache(cache):
+    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+    with open(CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=2)
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+
+def log(msg):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] [asana-sync] {msg}"
+    print(line)
+    with open(LOG_FILE, "a") as f:
+        f.write(line + "\n")
+
+# ── Asana API client ─────────────────────────────────────────────────────────
+
+class AsanaClient:
+    BASE = "https://app.asana.com/api/1.0"
+
+    def __init__(self, pat):
+        if not pat or pat.startswith("your-"):
+            raise ValueError(
+                "Set ASANA_PAT in config/asana.conf\n"
+                "  Get a token at: https://app.asana.com/0/my-apps"
+            )
+        self.headers = {
+            "Authorization": f"Bearer {pat}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    def _req(self, method, path, data=None, params=None, retries=3):
+        url = f"{self.BASE}{path}"
+        if params:
+            url += "?" + urllib.parse.urlencode(
+                {k: v for k, v in params.items() if v is not None}
+            )
+        body = json.dumps({"data": data}).encode() if data is not None else None
+        for attempt in range(retries):
+            req = urllib.request.Request(
+                url, data=body, headers=self.headers, method=method
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    return json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode()
+                if e.code == 429:
+                    wait = 2 ** attempt * 5
+                    log(f"Rate limited, waiting {wait}s")
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(
+                    f"Asana {method} {path} → {e.code}: {err_body}"
+                ) from e
+        raise RuntimeError(f"Asana {method} {path} failed after {retries} retries")
+
+    def get(self, path, params=None):
+        return self._req("GET", path, params=params)
+
+    def post(self, path, data):
+        return self._req("POST", path, data=data)
+
+    def put(self, path, data):
+        return self._req("PUT", path, data=data)
+
+    def get_all(self, path, params=None):
+        params = dict(params or {})
+        params.setdefault("limit", 100)
+        results = []
+        while True:
+            resp = self.get(path, params)
+            results.extend(resp.get("data", []))
+            nxt = resp.get("next_page")
+            if not nxt or not nxt.get("offset"):
+                break
+            params["offset"] = nxt["offset"]
+        return results
+
+# ── Project & section bootstrap ──────────────────────────────────────────────
+
+SECTIONS = [
+    "🤖 Agent Status Dashboard",
+    "📧 Trade Alerts",
+    "📁 Drive Activity",
+    "✅ Action Items",
+]
+
+def ensure_project(client, conf, cache):
+    gid = conf.get("ASANA_PROJECT_GID", "")
+    if gid:
+        return gid
+
+    name = conf.get("ASANA_PROJECT_NAME", "Agent Orchestration Tracker")
+
+    # Get workspace
+    ws_gid = conf.get("ASANA_WORKSPACE_GID", "")
+    if not ws_gid:
+        me = client.get("/users/me", {"opt_fields": "workspaces"})["data"]
+        ws_gid = me["workspaces"][0]["gid"]
+        save_conf_field("ASANA_WORKSPACE_GID", ws_gid)
+
+    # Search for existing project
+    projects = client.get_all(
+        "/projects", {"workspace": ws_gid, "opt_fields": "name,gid"}
+    )
+    for p in projects:
+        if p["name"] == name:
+            gid = p["gid"]
+            break
+
+    if not gid:
+        log(f"Creating project: {name}")
+        resp = client.post("/projects", {
+            "name": name,
+            "workspace": ws_gid,
+            "color": "light-blue",
+            "notes": "Auto-managed by AI Orchestrator. Do not rename tasks that start with [agent] or 📊.",
+        })
+        gid = resp["data"]["gid"]
+
+    save_conf_field("ASANA_PROJECT_GID", gid)
+    cache["project_gid"] = gid
+    log(f"Project GID: {gid}")
+    return gid
+
+def ensure_sections(client, project_gid, cache):
+    cached = cache.get("sections", {})
+    existing = {
+        s["name"]: s["gid"]
+        for s in client.get_all(
+            f"/projects/{project_gid}/sections",
+            {"opt_fields": "name,gid"}
+        )
+    }
+    result = {}
+    for name in SECTIONS:
+        if name in existing:
+            result[name] = existing[name]
+        else:
+            log(f"Creating section: {name}")
+            resp = client.post(
+                f"/projects/{project_gid}/sections", {"name": name}
+            )
+            result[name] = resp["data"]["gid"]
+    cache["sections"] = result
+    return result
+
+def get_or_create_task(client, project_gid, section_gid, task_name, notes, cache):
+    """Find task by name (via cache or API), create if missing. Return GID."""
+    task_key = f"{project_gid}:{task_name}"
+    cached_gid = cache.get("tasks", {}).get(task_key)
+
+    # Verify cached GID still valid
+    if cached_gid:
+        try:
+            client.get(f"/tasks/{cached_gid}", {"opt_fields": "gid,name"})
+        except Exception:
+            cached_gid = None
+            cache.get("tasks", {}).pop(task_key, None)
+
+    if cached_gid:
+        client.put(f"/tasks/{cached_gid}", {"notes": notes, "completed": False})
+        return cached_gid
+
+    # Search in project
+    tasks = client.get_all(
+        f"/projects/{project_gid}/tasks",
+        {"opt_fields": "name,gid", "completed_since": "now"}
+    )
+    for t in tasks:
+        if t["name"] == task_name:
+            gid = t["gid"]
+            cache.setdefault("tasks", {})[task_key] = gid
+            client.put(f"/tasks/{gid}", {"notes": notes, "completed": False})
+            return gid
+
+    # Create new
+    resp = client.post("/tasks", {
+        "name": task_name,
+        "notes": notes,
+        "projects": [project_gid],
+        "memberships": [{"project": project_gid, "section": section_gid}],
+    })
+    gid = resp["data"]["gid"]
+    cache.setdefault("tasks", {})[task_key] = gid
+    log(f"  Created task: {task_name}")
+    return gid
+
+# ── Agent state helpers ───────────────────────────────────────────────────────
+
+STATUS_EMOJI = {
+    "running":  "🟢",
+    "idle":     "🔵",
+    "quota":    "🟡",
+    "error":    "🔴",
+    "stopped":  "⚫",
+    "disabled": "⚪",
+}
+
+def get_agents():
+    agents_dir = os.path.join(ORCH_HOME, "agents")
+    return sorted(
+        d for d in os.listdir(agents_dir)
+        if os.path.isdir(os.path.join(agents_dir, d))
+        and os.path.isfile(os.path.join(agents_dir, d, "config.conf"))
+    )
+
+def load_checkpoint(agent_id):
+    path = os.path.join(ORCH_HOME, "checkpoints", f"{agent_id}.json")
+    if not os.path.isfile(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+def agent_enabled(agent_id):
+    conf = os.path.join(ORCH_HOME, "agents", agent_id, "config.conf")
+    try:
+        with open(conf) as f:
+            for line in f:
+                if line.strip().startswith("ENABLED="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'") == "true"
+    except Exception:
+        pass
+    return False
+
+def session_alive(agent_id):
+    r = subprocess.run(
+        ["tmux", "has-session", "-t", f"ai-{agent_id}"], capture_output=True
+    )
+    return r.returncode == 0
+
+def effective_status(agent_id, cp):
+    if not agent_enabled(agent_id):
+        return "disabled"
+    if not session_alive(agent_id):
+        return "stopped"
+    return cp.get("status", "running") or "running"
+
+def fmt_ts(iso_str):
+    if not iso_str:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return str(iso_str)[:16]
+
+# ── Section syncs ─────────────────────────────────────────────────────────────
+
+def sync_agents(client, project_gid, sections, cache, target_agent=None):
+    """Sync agent status tasks and the dashboard overview task."""
+    sec_gid = sections["🤖 Agent Status Dashboard"]
+    agents = get_agents()
+    agents_data = {}
+
+    for agent_id in agents:
+        if target_agent and agent_id != target_agent:
+            continue
+        cp = load_checkpoint(agent_id)
+        status = effective_status(agent_id, cp)
+        agents_data[agent_id] = (cp, status)
+
+        emoji = STATUS_EMOJI.get(status, "❓")
+        notes = "\n".join([
+            f"Status: {emoji} {status}",
+            f"Iteration: {cp.get('iteration', 0)}",
+            f"Last checkpoint: {fmt_ts(cp.get('last_checkpoint'))}",
+            f"Backoff: {cp.get('backoff', 0)}s",
+            "",
+            "Last output:",
+            cp.get("context", "(no output yet)") or "(no output yet)",
+        ])
+        get_or_create_task(
+            client, project_gid, sec_gid,
+            f"[agent] {agent_id}", notes, cache
+        )
+        log(f"  synced agent: {agent_id} ({status})")
+
+    # Dashboard overview (only on full sync or if no specific agent targeted)
+    if not target_agent:
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        daemon_pid = os.path.join(ORCH_HOME, "run", "daemon.pid")
+        daemon_status = "running" if os.path.isfile(daemon_pid) else "stopped"
+
+        rows = "\n".join(
+            f"  {a}: {STATUS_EMOJI.get(s, '❓')} {s}  (iter {cp.get('iteration', 0)}, last {fmt_ts(cp.get('last_checkpoint'))})"
+            for a, (cp, s) in agents_data.items()
+        )
+        notes = "\n".join([
+            f"Last sync: {now}",
+            f"Daemon: {daemon_status}",
+            "",
+            "Agent Status:",
+            rows or "  (no agents configured)",
+        ])
+        get_or_create_task(
+            client, project_gid, sec_gid,
+            "📊 System Dashboard", notes, cache
+        )
+        log("  synced: dashboard")
+
+def sync_trade_alerts(client, project_gid, sections, cache):
+    """Create Asana tasks for new trade alerts logged by the trade-alerts agent."""
+    sec_gid = sections["📧 Trade Alerts"]
+    alerts_dir = WORKSPACE / "trade-alerts"
+    if not alerts_dir.exists():
+        log("  trade-alerts workspace not found — skipping")
+        return
+
+    # Read all JSON alert files from the last 7 days
+    for json_file in sorted(alerts_dir.glob("*.json")):
+        try:
+            with open(json_file) as f:
+                alerts = json.load(f)
+            if not isinstance(alerts, list):
+                alerts = [alerts]
+            for alert in alerts:
+                date = alert.get("date", json_file.stem)
+                ticker = alert.get("ticker", "UNKNOWN")
+                action = alert.get("action", "")
+                price = alert.get("price", "")
+                subject = alert.get("subject", "")
+                task_name = f"[trade] {date} {ticker} {action}".strip()
+                notes = "\n".join([
+                    f"Date: {date}",
+                    f"Ticker: {ticker}",
+                    f"Action: {action}",
+                    f"Price: {price}",
+                    f"Subject: {subject}",
+                    f"Details: {alert.get('details', '')}",
+                ])
+                get_or_create_task(
+                    client, project_gid, sec_gid, task_name, notes, cache
+                )
+        except Exception as e:
+            log(f"  Warning: could not read {json_file}: {e}")
+
+def sync_drive_activity(client, project_gid, sections, cache):
+    """Create Asana tasks for drive file changes logged by the drive-organizer agent."""
+    sec_gid = sections["📁 Drive Activity"]
+    changes_file = WORKSPACE / "drive-organizer" / "changes.json"
+    if not changes_file.exists():
+        log("  drive-organizer changes.json not found — skipping")
+        return
+
+    try:
+        with open(changes_file) as f:
+            changes = json.load(f)
+        if not isinstance(changes, list):
+            changes = [changes]
+        for change in changes:
+            date = change.get("date", "")
+            filename = change.get("file", "")
+            action = change.get("action", "modified")
+            folder = change.get("folder", "")
+            task_name = f"[drive] {date} {action}: {filename}"[:140]
+            notes = "\n".join([
+                f"Date: {date}",
+                f"File: {filename}",
+                f"Action: {action}",
+                f"Folder: {folder}",
+                f"Link: {change.get('link', '')}",
+            ])
+            get_or_create_task(
+                client, project_gid, sec_gid, task_name, notes, cache
+            )
+    except Exception as e:
+        log(f"  Warning: could not read drive changes: {e}")
+
+def sync_action_items(client, project_gid, sections, cache):
+    """Sync inbox action items from actions.md into Asana."""
+    sec_gid = sections["✅ Action Items"]
+    actions_file = WORKSPACE / "inbox" / "actions.md"
+    if not actions_file.exists():
+        log("  inbox actions.md not found — skipping")
+        return
+
+    content = actions_file.read_text()
+    # Parse "### N. Title" blocks
+    blocks = re.split(r'\n(?=###\s)', content)
+    for block in blocks:
+        m = re.match(r'###\s+\d+\.\s+(.+)', block.strip())
+        if not m:
+            continue
+        title = m.group(1).strip()
+        task_name = f"[inbox] {title}"[:140]
+        notes = block.strip()
+        get_or_create_task(
+            client, project_gid, sec_gid, task_name, notes, cache
+        )
+        log(f"  synced action: {title[:60]}")
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+    target_agent  = None
+    target_section = None
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--agent" and i + 1 < len(args):
+            target_agent = args[i + 1]; i += 2
+        elif args[i] == "--section" and i + 1 < len(args):
+            target_section = args[i + 1]; i += 2
+        else:
+            i += 1
+
+    conf = load_conf()
+    pat = conf.get("ASANA_PAT", "")
+    if not pat or pat.startswith("your-"):
+        print("ERROR: Add your Asana Personal Access Token to config/asana.conf", file=sys.stderr)
+        print("       Get one at: https://app.asana.com/0/my-apps", file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs(os.path.join(ORCH_HOME, "run"), exist_ok=True)
+    os.makedirs(os.path.join(ORCH_HOME, "logs"), exist_ok=True)
+
+    client = AsanaClient(pat)
+    cache  = load_cache()
+
+    log("=== asana-sync start ===")
+
+    project_gid = ensure_project(client, conf, cache)
+    sections    = ensure_sections(client, project_gid, cache)
+
+    try:
+        if target_section in (None, "agents") or target_agent:
+            sync_agents(client, project_gid, sections, cache, target_agent)
+
+        if target_section in (None, "trades") and not target_agent:
+            sync_trade_alerts(client, project_gid, sections, cache)
+
+        if target_section in (None, "drive") and not target_agent:
+            sync_drive_activity(client, project_gid, sections, cache)
+
+        if target_section in (None, "actions") and not target_agent:
+            sync_action_items(client, project_gid, sections, cache)
+
+    finally:
+        save_cache(cache)
+
+    log("=== asana-sync done ===")
+
+if __name__ == "__main__":
+    main()

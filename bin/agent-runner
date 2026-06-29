@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# agent-runner — runs one agent in a loop with checkpointing, quota backoff, and clean shutdown
+# Usage: agent-runner <agent-id>
+set -uo pipefail
+
+_SRC="${BASH_SOURCE[0]}"
+while [[ -L "$_SRC" ]]; do
+    _DIR="$(cd -P "$(dirname "$_SRC")" && pwd)"
+    _SRC="$(readlink "$_SRC")"
+    [[ "$_SRC" != /* ]] && _SRC="$_DIR/$_SRC"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_SRC")" && pwd)"
+ORCH_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+export ORCH_HOME
+
+AGENT_ID="${1:?Usage: agent-runner <agent-id>}"
+
+# Load global defaults
+source "$ORCH_HOME/config/settings.conf"
+
+# Set paths
+AGENT_DIR="$AGENTS_DIR/$AGENT_ID"
+CHECKPOINT_FILE="$CHECKPOINTS_DIR/${AGENT_ID}.json"
+LOG_FILE="$LOGS_DIR/${AGENT_ID}.log"
+PID_FILE="$RUN_DIR/${AGENT_ID}.pid"
+HEARTBEAT_FILE="$RUN_DIR/${AGENT_ID}.heartbeat"
+OUT_TMP="$RUN_DIR/${AGENT_ID}.out"
+
+[[ -f "$AGENT_DIR/config.conf" ]] || { echo "No config for agent: $AGENT_ID" >&2; exit 1; }
+source "$AGENT_DIR/config.conf"
+
+# Runtime state
+ITERATION=0
+BACKOFF=0
+STATUS="starting"
+LAST_CONTEXT=""
+CONVERSATION_ID=""
+QUIT=0
+HEARTBEAT_PID=""
+
+# ── Signal handling ──────────────────────────────────────────────────────────
+
+trap '_on_signal' SIGTERM SIGINT
+trap '_on_exit' EXIT
+
+_on_signal() {
+    log "Stop signal received — checkpointing and exiting"
+    QUIT=1
+    [[ -n "$HEARTBEAT_PID" ]] && kill "$HEARTBEAT_PID" 2>/dev/null
+    checkpoint_save "stopped"
+}
+
+_on_exit() {
+    # Don't remove HEARTBEAT_FILE here — SIGKILL skips this trap anyway,
+    # leaving stale timestamps. Fresh startup overwrites it instead.
+    rm -f "$PID_FILE" "$OUT_TMP"
+}
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+
+log() {
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    printf '[%s] [%s] %s\n' "$ts" "$AGENT_ID" "$*" | tee -a "$LOG_FILE"
+}
+
+die() { log "FATAL: $*"; exit 1; }
+
+rotate_log() {
+    local size_kb
+    size_kb=$(du -k "$LOG_FILE" 2>/dev/null | cut -f1 || echo 0)
+    if (( size_kb > LOG_MAX_KB )); then
+        mv "$LOG_FILE" "${LOG_FILE}.old"
+        log "Log rotated (was ${size_kb}KB)"
+    fi
+}
+
+# ── Checkpoint ───────────────────────────────────────────────────────────────
+
+checkpoint_save() {
+    local status="${1:-$STATUS}"
+    local tmp="${CHECKPOINT_FILE}.tmp"
+    mkdir -p "$(dirname "$CHECKPOINT_FILE")"
+    jq -n \
+        --arg agent_id    "$AGENT_ID" \
+        --arg status      "$status" \
+        --argjson iter    "$ITERATION" \
+        --arg ts          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --argjson backoff "$BACKOFF" \
+        --arg ctx         "$LAST_CONTEXT" \
+        --arg conv_id     "$CONVERSATION_ID" \
+        '{
+            agent_id:        $agent_id,
+            status:          $status,
+            iteration:       $iter,
+            last_checkpoint: $ts,
+            backoff:         $backoff,
+            context:         $ctx,
+            conversation_id: $conv_id
+        }' > "$tmp" && mv "$tmp" "$CHECKPOINT_FILE"
+}
+
+checkpoint_load() {
+    [[ -f "$CHECKPOINT_FILE" ]] || return 0
+    ITERATION=$(jq -r       '.iteration       // 0'  "$CHECKPOINT_FILE")
+    BACKOFF=$(jq -r         '.backoff         // 0'  "$CHECKPOINT_FILE")
+    LAST_CONTEXT=$(jq -r    '.context         // ""' "$CHECKPOINT_FILE")
+    CONVERSATION_ID=$(jq -r '.conversation_id // ""' "$CHECKPOINT_FILE")
+    local prev_status
+    prev_status=$(jq -r '.status // "unknown"' "$CHECKPOINT_FILE")
+    log "Resumed from checkpoint: iteration=$ITERATION prev_status=$prev_status"
+}
+
+# ── Heartbeat ────────────────────────────────────────────────────────────────
+
+start_heartbeat() {
+    (while true; do
+        date +%s > "$HEARTBEAT_FILE"
+        sleep "${CHECKPOINT_INTERVAL:-60}"
+    done) &
+    HEARTBEAT_PID=$!
+}
+
+stop_heartbeat() {
+    [[ -n "$HEARTBEAT_PID" ]] && kill "$HEARTBEAT_PID" 2>/dev/null && HEARTBEAT_PID=""
+}
+
+# ── Prompt building ──────────────────────────────────────────────────────────
+
+build_prompt() {
+    local base
+    base=$(cat "$AGENT_DIR/prompt.md" 2>/dev/null || echo "You are a helpful AI agent.")
+
+    if [[ -n "$LAST_CONTEXT" ]]; then
+        printf '%s\n\n---\n## Resume Context\n\nIteration: %d\nPrevious output summary:\n%s\n' \
+            "$base" "$ITERATION" "$LAST_CONTEXT"
+    else
+        printf '%s\n' "$base"
+    fi
+}
+
+# ── Quota / error detection ──────────────────────────────────────────────────
+
+is_quota_error() {
+    grep -qiE \
+        "overloaded|rate.?limit|quota.?exceed|too.?many.?request|credit.?balanc|insufficient.?balance|529|Errno 529" \
+        <<< "$1"
+}
+
+# ── Run one iteration ────────────────────────────────────────────────────────
+
+run_iteration() {
+    local prompt="$1"
+    rotate_log
+    printf '\n=== ITER %d START %s ===\n' "$ITERATION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG_FILE"
+
+    local workdir="${WORKDIR:-$HOME}"
+    mkdir -p "$workdir" 2>/dev/null
+
+    start_heartbeat
+
+    local run_exit=0
+    local strategy="${RESUME_STRATEGY:-fresh}"
+
+    case "$strategy" in
+        continue)
+            if (( ITERATION > 1 )) || [[ -n "$CONVERSATION_ID" ]]; then
+                (cd "$workdir" && $AGENT_CMD $AGENT_ARGS --continue 2>&1) \
+                    | tee -a "$LOG_FILE" > "$OUT_TMP"
+                run_exit=${PIPESTATUS[0]}
+            else
+                (cd "$workdir" && $AGENT_CMD $AGENT_ARGS -p "$prompt" 2>&1) \
+                    | tee -a "$LOG_FILE" > "$OUT_TMP"
+                run_exit=${PIPESTATUS[0]}
+            fi
+            ;;
+        resume)
+            if [[ -n "$CONVERSATION_ID" ]]; then
+                (cd "$workdir" && $AGENT_CMD $AGENT_ARGS --resume "$CONVERSATION_ID" 2>&1) \
+                    | tee -a "$LOG_FILE" > "$OUT_TMP"
+                run_exit=${PIPESTATUS[0]}
+            else
+                (cd "$workdir" && $AGENT_CMD $AGENT_ARGS -p "$prompt" 2>&1) \
+                    | tee -a "$LOG_FILE" > "$OUT_TMP"
+                run_exit=${PIPESTATUS[0]}
+            fi
+            ;;
+        fresh|*)
+            (cd "$workdir" && $AGENT_CMD $AGENT_ARGS -p "$prompt" 2>&1) \
+                | tee -a "$LOG_FILE" > "$OUT_TMP"
+            run_exit=${PIPESTATUS[0]}
+            ;;
+    esac
+
+    stop_heartbeat
+
+    local output=""
+    [[ -f "$OUT_TMP" ]] && output=$(cat "$OUT_TMP")
+    rm -f "$OUT_TMP"
+
+    printf '=== ITER %d END exit=%d %s ===\n' \
+        "$ITERATION" "$run_exit" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG_FILE"
+
+    if is_quota_error "$output"; then
+        log "Quota / rate-limit detected"
+        return 2
+    fi
+
+    # Save last ~5 lines as context for next iteration
+    LAST_CONTEXT=$(printf '%s' "$output" | tail -5 | tr '\n' ' ' | sed 's/  */ /g' | cut -c1-500)
+    return "$run_exit"
+}
+
+# ── Asana sync hook ──────────────────────────────────────────────────────────
+
+asana_sync_hook() {
+    local sync_bin="$ORCH_HOME/bin/asana-sync"
+    local asana_conf="$ORCH_HOME/config/asana.conf"
+    [[ -x "$sync_bin" && -f "$asana_conf" ]] || return 0
+
+    local sync_enabled
+    sync_enabled=$(bash -c "source '$asana_conf'; echo \${ASANA_SYNC_ON_ITERATION:-false}" 2>/dev/null)
+    [[ "$sync_enabled" != "true" ]] && return 0
+
+    local pat
+    pat=$(bash -c "source '$asana_conf'; echo \${ASANA_PAT:-}" 2>/dev/null)
+    [[ -z "$pat" || "$pat" == your-* ]] && return 0
+
+    log "Syncing to Asana..."
+    python3 "$sync_bin" --agent "$AGENT_ID" >> "$LOG_FILE" 2>&1 || \
+        log "Asana sync failed (non-fatal)"
+}
+
+# ── Main loop ────────────────────────────────────────────────────────────────
+
+main() {
+    mkdir -p "$CHECKPOINTS_DIR" "$LOGS_DIR" "$RUN_DIR"
+    echo $$ > "$PID_FILE"
+    date +%s > "$HEARTBEAT_FILE"   # write immediately so daemon doesn't kill us before first iteration
+
+    log "=== Agent $AGENT_ID starting (PID $$) ==="
+    checkpoint_load
+
+    while (( QUIT == 0 )); do
+        ITERATION=$(( ITERATION + 1 ))
+        STATUS="running"
+        checkpoint_save
+
+        local prompt
+        prompt=$(build_prompt)
+
+        run_iteration "$prompt"
+        local ret=$?
+
+        (( QUIT == 1 )) && break
+
+        case $ret in
+            0)
+                BACKOFF=0
+                STATUS="idle"
+                checkpoint_save
+                asana_sync_hook
+                log "Iteration $ITERATION done. Next in ${IDLE_INTERVAL:-120}s"
+                sleep "${IDLE_INTERVAL:-120}"
+                ;;
+            2)
+                # Quota backoff — double each time, cap at max
+                if (( BACKOFF == 0 )); then
+                    BACKOFF="${QUOTA_INITIAL_BACKOFF:-300}"
+                else
+                    BACKOFF=$(( BACKOFF * 2 ))
+                fi
+                local max_bo="${QUOTA_MAX_BACKOFF:-3600}"
+                (( BACKOFF > max_bo )) && BACKOFF=$max_bo
+                STATUS="quota"
+                checkpoint_save
+                log "Quota hit — backing off ${BACKOFF}s"
+                sleep "$BACKOFF"
+                ;;
+            *)
+                # Generic error backoff
+                if (( BACKOFF == 0 )); then BACKOFF=60; else BACKOFF=$(( BACKOFF * 2 )); fi
+                local max_err="${ERROR_MAX_BACKOFF:-900}"
+                (( BACKOFF > max_err )) && BACKOFF=$max_err
+                STATUS="error"
+                checkpoint_save
+                log "Error (exit $ret) — backing off ${BACKOFF}s"
+                sleep "$BACKOFF"
+                ;;
+        esac
+    done
+
+    log "=== Agent $AGENT_ID stopped cleanly ==="
+}
+
+main "$@"

@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# orch-daemon — watchdog that launchd keeps alive; restarts dead agent sessions
+# launchd → orch-daemon → [tmux sessions per agent]
+set -uo pipefail
+
+_SRC="${BASH_SOURCE[0]}"
+while [[ -L "$_SRC" ]]; do
+    _DIR="$(cd -P "$(dirname "$_SRC")" && pwd)"
+    _SRC="$(readlink "$_SRC")"
+    [[ "$_SRC" != /* ]] && _SRC="$_DIR/$_SRC"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_SRC")" && pwd)"
+ORCH_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+export ORCH_HOME
+
+source "$ORCH_HOME/config/settings.conf"
+
+DAEMON_LOG="$LOGS_DIR/daemon.log"
+DAEMON_LOCK="$RUN_DIR/daemon.lock"
+DAEMON_PID_FILE="$RUN_DIR/daemon.pid"
+CHECK_INTERVAL=30
+QUIT=0
+
+trap '_stop' SIGTERM SIGINT
+trap '_exit' EXIT
+
+_stop() { log "Daemon stopping"; QUIT=1; }
+_exit() { rm -f "$DAEMON_PID_FILE" "$DAEMON_LOCK"; }
+
+log() {
+    # When running under launchd, stdout already goes to daemon.log — write only once
+    printf '[%s] [daemon] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$DAEMON_LOG"
+}
+
+acquire_lock() {
+    # Use a lock file to prevent duplicate daemon instances
+    local lock_pid
+    if [[ -f "$DAEMON_LOCK" ]]; then
+        lock_pid=$(cat "$DAEMON_LOCK")
+        if kill -0 "$lock_pid" 2>/dev/null; then
+            echo "Another daemon already running (PID $lock_pid). Exiting." >&2
+            exit 0
+        fi
+        rm -f "$DAEMON_LOCK"
+    fi
+    echo $$ > "$DAEMON_LOCK"
+}
+
+list_enabled_agents() {
+    for dir in "$AGENTS_DIR"/*/; do
+        local id cfg enabled
+        id=$(basename "$dir")
+        cfg="$dir/config.conf"
+        [[ -f "$cfg" ]] || continue
+        enabled=$(bash -c "source '$ORCH_HOME/config/settings.conf'; source '$cfg'; echo \${ENABLED:-false}")
+        [[ "$enabled" == "true" ]] && echo "$id"
+    done
+}
+
+session_alive() {
+    tmux has-session -t "${TMUX_PREFIX}${1}" 2>/dev/null
+}
+
+agent_pid_alive() {
+    local pid_file="$RUN_DIR/${1}.pid"
+    [[ -f "$pid_file" ]] || return 1
+    local pid
+    pid=$(cat "$pid_file")
+    kill -0 "$pid" 2>/dev/null
+}
+
+heartbeat_stale() {
+    local agent_id="$1"
+    local hb_file="$RUN_DIR/${agent_id}.heartbeat"
+    # No heartbeat file = agent just started; give it a grace period
+    [[ -f "$hb_file" ]] || return 1
+    local hb_ts diff
+    hb_ts=$(cat "$hb_file")
+    diff=$(( $(date +%s) - hb_ts ))
+    # Only flag stale if significantly older than health threshold
+    # Use 2x HEALTH_MAX_SILENT to avoid killing agents that are mid-run
+    local threshold=$(( HEALTH_MAX_SILENT * 2 ))
+    (( diff > threshold ))
+}
+
+start_agent_session() {
+    local id="$1"
+    local session="${TMUX_PREFIX}${id}"
+    # Clear stale heartbeat/pid before starting so fresh ones are written
+    rm -f "$RUN_DIR/${id}.heartbeat" "$RUN_DIR/${id}.pid"
+    log "Starting tmux session: $session"
+    tmux new-session -d -s "$session" \
+        -e "ORCH_HOME=$ORCH_HOME" \
+        "$ORCH_HOME/bin/agent-runner $id"
+}
+
+kill_agent_session() {
+    local id="$1"
+    local session="${TMUX_PREFIX}${id}"
+    log "Recycling hung session: $session"
+    tmux kill-session -t "$session" 2>/dev/null || true
+    rm -f "$RUN_DIR/${id}.heartbeat" "$RUN_DIR/${id}.pid"
+    sleep 2
+}
+
+sweep() {
+    while IFS= read -r id; do
+        [[ -z "$id" ]] && continue
+
+        if ! session_alive "$id"; then
+            log "Agent $id not running — restarting"
+            start_agent_session "$id"
+
+        elif ! agent_pid_alive "$id"; then
+            # Session exists but agent process is dead (shell exited, stuck at prompt)
+            log "Agent $id session alive but process dead — recycling"
+            kill_agent_session "$id"
+            start_agent_session "$id"
+
+        elif heartbeat_stale "$id"; then
+            log "Agent $id heartbeat stale (>$((HEALTH_MAX_SILENT * 2))s) — recycling"
+            kill_agent_session "$id"
+            start_agent_session "$id"
+        fi
+    done < <(list_enabled_agents)
+}
+
+main() {
+    mkdir -p "$LOGS_DIR" "$RUN_DIR"
+    acquire_lock  # exit immediately if another daemon is already running
+    echo $$ > "$DAEMON_PID_FILE"
+    log "=== Daemon started (PID $$) ==="
+
+    sleep 5  # let tmux server settle on fresh boot
+
+    while (( QUIT == 0 )); do
+        sweep
+        sleep "$CHECK_INTERVAL"
+    done
+
+    log "=== Daemon stopped ==="
+}
+
+main "$@"
