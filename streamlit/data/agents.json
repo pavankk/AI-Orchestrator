@@ -1,0 +1,86 @@
+[
+    {
+        "id": "coding",
+        "description": "Autonomous coding: picks up tasks from queue, implements, tests",
+        "enabled": false,
+        "status": "disabled",
+        "iteration": 0,
+        "last_checkpoint": "",
+        "backoff": 0,
+        "context": "",
+        "idle_interval": 60,
+        "heartbeat_age_s": null
+    },
+    {
+        "id": "docs",
+        "description": "Sync docs with code: detects drift, updates README/API docs",
+        "enabled": false,
+        "status": "disabled",
+        "iteration": 0,
+        "last_checkpoint": "",
+        "backoff": 0,
+        "context": "",
+        "idle_interval": 1800,
+        "heartbeat_age_s": null
+    },
+    {
+        "id": "drive-organizer",
+        "description": "Watch Google Drive, organise files into folders, log changes",
+        "enabled": false,
+        "status": "disabled",
+        "iteration": 0,
+        "last_checkpoint": "",
+        "backoff": 0,
+        "context": "",
+        "idle_interval": 1800,
+        "heartbeat_age_s": null
+    },
+    {
+        "id": "inbox",
+        "description": "Email triage, draft replies, extract action items",
+        "enabled": true,
+        "status": "stopped",
+        "iteration": 304,
+        "last_checkpoint": "2026-06-29T15:52:53Z",
+        "backoff": 0,
+        "context": "5. **4 recruiter drafts** waiting in `drafts/` (a16z, eTeam, Verizon, Agero). ``` STATUS: processed=2 | drafts=0 | actions=0 | urgent=3 ```",
+        "idle_interval": 300,
+        "heartbeat_age_s": 2578
+    },
+    {
+        "id": "monitoring",
+        "description": "System health: disk, memory, processes, agent heartbeats",
+        "enabled": true,
+        "status": "stopped",
+        "iteration": 336,
+        "last_checkpoint": "2026-06-29T15:53:55Z",
+        "backoff": 0,
+        "context": "STATUS: checks=6 | alerts=0 | status=ok Disk 2%, mem 887MB free (up from 259MB last run), CPU idle, no orchestrator files, log 34KB.",
+        "idle_interval": 300,
+        "heartbeat_age_s": 2525
+    },
+    {
+        "id": "research",
+        "description": "Autonomous research: investigates topics, saves structured findings",
+        "enabled": false,
+        "status": "disabled",
+        "iteration": 0,
+        "last_checkpoint": "",
+        "backoff": 0,
+        "context": "",
+        "idle_interval": 600,
+        "heartbeat_age_s": null
+    },
+    {
+        "id": "trade-alerts",
+        "description": "Fetch trade alert emails from Gmail, log tickers and signals",
+        "enabled": false,
+        "status": "disabled",
+        "iteration": 0,
+        "last_checkpoint": "",
+        "backoff": 0,
+        "context": "",
+        "idle_interval": 3600,
+        "heartbeat_age_s": null
+    }
+]

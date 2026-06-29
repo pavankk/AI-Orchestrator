@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# Export orchestrator state to streamlit/data/ for cloud dashboard deployment.
+# Run this after each daemon cycle or on a schedule, then commit streamlit/data/.
+#
+# Usage: bin/export-dashboard-data [--commit]
+#   --commit  auto git-add and commit streamlit/data/
+
+set -euo pipefail
+
+ORCH_HOME="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=../config/settings.conf
+source "$ORCH_HOME/config/settings.conf"
+
+DATA_DIR="$ORCH_HOME/streamlit/data"
+mkdir -p "$DATA_DIR"
+
+NOW_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# ── agents.json ───────────────────────────────────────────────────────────────
+
+agents_json="["
+first=true
+
+for aid in coding docs drive-organizer inbox monitoring research trade-alerts; do
+  cfg="$AGENTS_DIR/$aid/config.conf"
+  ckpt="$CHECKPOINTS_DIR/$aid.json"
+  hb="$RUN_DIR/$aid.heartbeat"
+
+  # parse config
+  enabled="false"
+  description="$aid"
+  idle_interval=300
+  if [[ -f "$cfg" ]]; then
+    v=$(grep -E '^ENABLED=' "$cfg" | head -1 | sed 's/ENABLED="\(.*\)"/\1/' | tr -d '"'); [[ -n "$v" ]] && enabled="$v"
+    v=$(grep -E '^DESCRIPTION=' "$cfg" | head -1 | sed 's/DESCRIPTION="\(.*\)"/\1/' | tr -d '"'); [[ -n "$v" ]] && description="$v"
+    v=$(grep -E '^IDLE_INTERVAL=' "$cfg" | head -1 | sed 's/IDLE_INTERVAL=\([0-9]*\).*/\1/'); [[ -n "$v" ]] && idle_interval="$v"
+  fi
+
+  # parse checkpoint
+  ckpt_status="unknown"
+  iteration=0
+  last_checkpoint=""
+  backoff=0
+  context=""
+  if [[ -f "$ckpt" ]]; then
+    ckpt_status=$(python3 -c "import json,sys; d=json.load(open('$ckpt')); print(d.get('status','unknown'))" 2>/dev/null || echo "unknown")
+    iteration=$(python3 -c "import json,sys; d=json.load(open('$ckpt')); print(d.get('iteration',0))" 2>/dev/null || echo "0")
+    last_checkpoint=$(python3 -c "import json,sys; d=json.load(open('$ckpt')); print(d.get('last_checkpoint',''))" 2>/dev/null || echo "")
+    backoff=$(python3 -c "import json,sys; d=json.load(open('$ckpt')); print(d.get('backoff',0))" 2>/dev/null || echo "0")
+    context=$(python3 -c "import json,sys; d=json.load(open('$ckpt')); print(d.get('context',''))" 2>/dev/null || echo "")
+  fi
+
+  # heartbeat age
+  hb_age="null"
+  if [[ -f "$hb" ]]; then
+    hb_ts=$(cat "$hb")
+    now_ts=$(date +%s)
+    hb_age=$(( now_ts - hb_ts ))
+  fi
+
+  # determine status
+  status="unknown"
+  if [[ "$enabled" != "true" ]]; then
+    status="disabled"
+  elif [[ "$ckpt_status" == "running" ]]; then
+    status="running"
+  elif [[ "$hb_age" != "null" ]] && (( hb_age < 900 )); then
+    status="idle"
+  elif [[ -f "$ckpt" ]]; then
+    status="stopped"
+  fi
+
+  # escape context for JSON
+  context_escaped=$(echo "$context" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))")
+
+  [[ "$first" == "false" ]] && agents_json+=","
+  first=false
+
+  agents_json+=$(cat <<JSON
+{
+  "id": "$aid",
+  "description": "$description",
+  "enabled": $enabled,
+  "status": "$status",
+  "iteration": $iteration,
+  "last_checkpoint": "$last_checkpoint",
+  "backoff": $backoff,
+  "context": $context_escaped,
+  "idle_interval": $idle_interval,
+  "heartbeat_age_s": $hb_age
+}
+JSON
+)
+done
+
+agents_json+="]"
+echo "$agents_json" | python3 -m json.tool > "$DATA_DIR/agents.json"
+echo "✓ agents.json"
+
+# ── system.json ───────────────────────────────────────────────────────────────
+
+pid_file="$RUN_DIR/daemon.pid"
+daemon_running=false
+daemon_pid="null"
+if [[ -f "$pid_file" ]]; then
+  pid=$(cat "$pid_file")
+  if kill -0 "$pid" 2>/dev/null; then
+    daemon_running=true
+    daemon_pid=$pid
+  fi
+fi
+
+enabled_count=$(grep -rl 'ENABLED="true"' "$AGENTS_DIR" 2>/dev/null | wc -l | tr -d ' ')
+total_count=$(ls "$AGENTS_DIR" | wc -l | tr -d ' ')
+
+cat > "$DATA_DIR/system.json" <<JSON
+{
+  "daemon_running": $daemon_running,
+  "daemon_pid": $daemon_pid,
+  "last_export": "$NOW_UTC",
+  "agents_enabled": $enabled_count,
+  "agents_total": $total_count,
+  "is_live": false
+}
+JSON
+echo "✓ system.json"
+
+# ── logs.json — last 150 lines per log ────────────────────────────────────────
+
+python3 - <<'PYEOF'
+import json, os, pathlib
+
+orch_home = pathlib.Path(os.environ.get("ORCH_HOME", "."))
+logs_dir = orch_home / "logs"
+data_dir = orch_home / "streamlit" / "data"
+
+result = {}
+for name in ["daemon", "inbox", "monitoring"]:
+    log_path = logs_dir / f"{name}.log"
+    if log_path.exists():
+        lines = log_path.read_text().splitlines()
+        result[name] = lines[-150:]
+    else:
+        result[name] = []
+
+(data_dir / "logs.json").write_text(json.dumps(result, indent=2))
+print("✓ logs.json")
+PYEOF
+
+echo ""
+echo "Exported to $DATA_DIR at $NOW_UTC"
+
+# ── Optional auto-commit ───────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "--commit" ]]; then
+  cd "$ORCH_HOME"
+  git add streamlit/data/
+  if git diff --cached --quiet; then
+    echo "No changes to commit."
+  else
+    git commit -m "chore: dashboard snapshot $NOW_UTC"
+    echo "Committed."
+  fi
+fi

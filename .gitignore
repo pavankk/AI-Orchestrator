@@ -6,3 +6,5 @@ logs/
 .claude/settings.local.json
 config/asana.conf
 bin/__pycache__/
+__pycache__/
+*.pyc
