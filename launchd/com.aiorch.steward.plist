@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.aiorch.steward.plist — weekly platform steward (Saturday 8am)
+  Installed to: ~/Library/LaunchAgents/com.aiorch.steward.plist
+  Re-generate by running: install.sh
+-->
+<plist version="1.0">
+<dict>
+
+  <key>Label</key>
+  <string>com.aiorch.steward</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>ORCH_HOME_PLACEHOLDER/bin/steward</string>
+  </array>
+
+  <!-- Saturday 8:00 AM -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>6</integer>
+    <key>Hour</key>
+    <integer>8</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>ORCH_HOME_PLACEHOLDER/logs/steward.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>ORCH_HOME_PLACEHOLDER/logs/steward-error.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ORCH_HOME</key>
+    <string>ORCH_HOME_PLACEHOLDER</string>
+    <key>HOME</key>
+    <string>HOME_PLACEHOLDER</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+</dict>
+</plist>

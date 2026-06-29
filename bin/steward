@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# bin/steward — weekly platform governance runner
+# Triggered by launchd com.aiorch.steward (Saturday 8am)
+# Collects platform context, injects into prompt, runs claude
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ORCH_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$ORCH_HOME/config/settings.conf"
+
+DATE="$(date +%Y-%m-%d)"
+TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+WORKSPACE="$HOME/ai-workspace/steward"
+PROMPT_TEMPLATE="$ORCH_HOME/agents/steward/prompt.md"
+REPORT_DIR="$HOME/Projects/memory/summaries/ai-orchestrator"
+LOG_FILE="$ORCH_HOME/logs/steward.log"
+
+mkdir -p "$WORKSPACE" "$REPORT_DIR" "$HOME/Projects/logs/errors"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [steward] $*" | tee -a "$LOG_FILE"; }
+
+log "=== Steward run started ==="
+
+# ── Collect platform context ──────────────────────────────────────────────────
+
+CONTEXT_FILE="$WORKSPACE/context-${DATE}.txt"
+
+{
+  echo "## Run Info"
+  echo "Date: $DATE | Timestamp: $TIMESTAMP"
+  echo ""
+
+  echo "## Agent Checkpoints"
+  for cp in "$ORCH_HOME/checkpoints/"*.json; do
+    [[ -f "$cp" ]] || continue
+    echo "### $(basename "$cp" .json)"
+    cat "$cp"
+    echo ""
+  done
+
+  echo "## Portability Check Output"
+  bash "$HOME/Projects/infrastructure/mac-mini/portability-check.sh" 2>&1 || true
+  echo ""
+
+  echo "## Git Status (all repos)"
+  for repo in "$HOME/Projects/ai/"*/ "$HOME/Projects/trading/"*/ "$HOME/Projects/edu/"/*/; do
+    [[ -d "$repo/.git" ]] || continue
+    name=$(basename "$repo")
+    echo "### $name"
+    git -C "$repo" log --oneline -5 2>/dev/null || echo "no git log"
+    git -C "$repo" branch -a --sort=-committerdate 2>/dev/null | head -10 || true
+    echo ""
+  done
+
+  echo "## Session Registry"
+  cat "$ORCH_HOME/session-registry.json" 2>/dev/null || echo "missing"
+  echo ""
+
+  echo "## Cost Logs (last 7 days)"
+  for f in "$HOME/Projects/logs/costs/"*.json; do
+    [[ -f "$f" ]] || continue
+    echo "$(basename "$f"):"
+    cat "$f"
+    echo ""
+  done
+
+  echo "## Disk Usage"
+  df -h "$HOME" 2>/dev/null
+  echo ""
+  du -sh "$HOME/Projects/"* 2>/dev/null | sort -rh | head -15
+  echo ""
+
+  echo "## Log Sizes"
+  find "$HOME/Projects/logs" "$ORCH_HOME/logs" -name "*.log" -exec du -sh {} \; 2>/dev/null | sort -rh | head -20
+  echo ""
+
+  echo "## Docker State"
+  docker ps -a 2>/dev/null || echo "docker not running"
+  docker system df 2>/dev/null || true
+  echo ""
+
+  echo "## Active Processes"
+  ps aux | grep -E "claude|node|python|streamlit" | grep -v grep | awk '{print $2, $3, $4, $NF}' || true
+  echo ""
+
+  echo "## Tmux Sessions"
+  tmux ls 2>/dev/null || echo "no tmux sessions"
+  echo ""
+
+  echo "## TODO Files"
+  for f in "$HOME/Projects/ai/"*/TODO.md "$HOME/Projects/trading/"*/TODO.md; do
+    [[ -f "$f" ]] || continue
+    proj=$(basename "$(dirname "$f")")
+    echo "### $proj/TODO.md"
+    cat "$f"
+    echo ""
+  done
+
+  echo "## SESSION_STATE Files"
+  for f in "$HOME/Projects/ai/"*/SESSION_STATE.json "$HOME/Projects/trading/"*/SESSION_STATE.json; do
+    [[ -f "$f" ]] || continue
+    proj=$(basename "$(dirname "$f")")
+    echo "### $proj"
+    python3 -c "
+import json, sys
+d = json.load(open('$f'))
+print('  remaining:', d.get('remaining', []))
+print('  open_decisions:', d.get('open_decisions', []))
+print('  blockers:', d.get('blockers', []))
+" 2>/dev/null || cat "$f"
+    echo ""
+  done
+
+} > "$CONTEXT_FILE" 2>&1
+
+log "Context collected: $(wc -l < "$CONTEXT_FILE") lines"
+
+# ── Build prompt ──────────────────────────────────────────────────────────────
+
+FINAL_PROMPT="$WORKSPACE/prompt-${DATE}.md"
+CONTEXT_CONTENT=$(cat "$CONTEXT_FILE")
+
+sed \
+  -e "s|{{DATE}}|$DATE|g" \
+  -e "s|{{STEWARD_CONTEXT}}|CONTEXT_PLACEHOLDER|g" \
+  "$PROMPT_TEMPLATE" > "$FINAL_PROMPT.tmp"
+
+# Replace placeholder with actual context (sed can't handle multiline easily)
+python3 - "$FINAL_PROMPT.tmp" "$CONTEXT_FILE" "$FINAL_PROMPT" << 'PYEOF'
+import sys
+template = open(sys.argv[1]).read()
+context = open(sys.argv[2]).read()
+result = template.replace("CONTEXT_PLACEHOLDER", context)
+open(sys.argv[3], 'w').write(result)
+PYEOF
+
+rm -f "$FINAL_PROMPT.tmp"
+log "Prompt built: $(wc -l < "$FINAL_PROMPT") lines"
+
+# ── Run claude ────────────────────────────────────────────────────────────────
+
+log "Running claude steward agent..."
+cd "$WORKSPACE"
+
+claude \
+  --dangerously-skip-permissions \
+  --print \
+  "$(cat "$FINAL_PROMPT")" \
+  >> "$LOG_FILE" 2>&1
+
+log "=== Steward run complete ==="
+echo "Report written to: $REPORT_DIR/${DATE}-steward.md"

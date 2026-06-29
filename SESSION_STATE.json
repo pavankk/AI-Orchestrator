@@ -1,0 +1,38 @@
+{
+  "project": "ai-orchestrator",
+  "session_id": "",
+  "timestamp": "2026-06-29T18:30:00Z",
+  "objective": "Maintain all agents healthy; enforce platform spec compliance",
+  "completed": [
+    "Migrated daemon from ~/AI_Orchestartor/ to ~/Projects/ai/AI-Orchestrator/",
+    "Created session-registry.json with all 7 agents",
+    "Fixed daily plist placeholder paths",
+    "Created all canonical directories per platform spec"
+  ],
+  "in_progress": "Platform spec compliance implementation",
+  "remaining": [
+    "Wire session-registry.json to orch status CLI",
+    "Add cost tracking to logs/costs/",
+    "Enable trade-alerts agent",
+    "Daily briefing script",
+    "Weekly maintenance script"
+  ],
+  "open_decisions": [
+    "Unify gmail-agent-cloud with inbox agent or keep separate?",
+    "When to enable trade-alerts, research, drive-organizer agents?"
+  ],
+  "blockers": [],
+  "current_branch": "main",
+  "last_commit": "31e56df",
+  "key_files": [
+    "bin/orch-daemon",
+    "bin/agent-runner",
+    "bin/orch",
+    "config/settings.conf",
+    "session-registry.json",
+    "checkpoints/"
+  ],
+  "env_vars_needed": ["ANTHROPIC_API_KEY", "ASANA_TOKEN"],
+  "resume_prompt": "Resume AI Orchestrator platform work. Daemon running PID ~17304 from ~/Projects/ai/AI-Orchestrator/. Agents: inbox + monitoring active. Next: wire session-registry.json to orch CLI, add cost tracking, daily briefing script.",
+  "token_cost_estimate": ""
+}
